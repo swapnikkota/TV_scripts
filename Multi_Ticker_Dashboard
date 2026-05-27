@@ -70,9 +70,7 @@ f_htf() =>
 // counters are independent for each ticker.
 // Returns [sig, price, rsi, atr, sl, tp1, tp2] — sig: 1=CALL, -1=PUT, 0=none
 f_compute(src_c, src_o, src_h, src_l, src_v, htf_bull, htf_bear) =>
-    tr       = math.max(math.max(src_h - src_l,
-                        math.abs(src_h - nz(src_c[1], src_c))),
-                        math.abs(src_l - nz(src_c[1], src_c)))
+    tr       = math.max(math.max(src_h - src_l,math.abs(src_h - nz(src_c[1], src_c))),math.abs(src_l - nz(src_c[1], src_c)))
     atr_v    = ta.rma(tr, atr_len)
     atr_s    = ta.sma(atr_v, atr_volat)
     ema_v    = ta.ema(src_c, ema_len)
@@ -163,9 +161,7 @@ if barstate.islast
         is_call = sig_v == 1
         is_put  = sig_v == -1
         sig_lbl = is_call ? "▲ CALL" : is_put ? "▼ PUT" : "—"
-        sig_bg  = is_call ? color.new(color.lime, 20)
-                : is_put  ? color.new(color.red,  20)
-                :            color.new(color.gray, 60)
+        sig_bg  = is_call ? color.new(color.lime, 20): is_put  ? color.new(color.red,  20):  color.new(color.gray, 60)
 
         table.cell(dash, 0, row + 1, array.get(tickers, row),
                    text_color=color.white,  text_size=size.small)
