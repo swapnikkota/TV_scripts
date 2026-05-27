@@ -1,0 +1,196 @@
+//@version=5
+indicator("Multi-Ticker Options Dashboard", overlay=false, max_labels_count=500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+g1 = "Core Filters"
+vol_mult     = input.float(1.5,   "Volume Multiplier",       minval=1.0,              group=g1)
+vol_len      = input.int(20,      "Avg Volume Lookback",     minval=5,                group=g1)
+ema_len      = input.int(21,      "Trend EMA Length",        minval=5,                group=g1)
+atr_len      = input.int(14,      "ATR Period",              minval=5,                group=g1)
+atr_volat    = input.int(10,      "Volatility Expansion MA", minval=3,                group=g1)
+
+g2 = "Momentum & Candle Quality"
+rsi_len      = input.int(14,      "RSI Length",              minval=5,                group=g2)
+rsi_bull_lo  = input.int(52,      "RSI Min (CALL)",          minval=30,               group=g2)
+rsi_bull_hi  = input.int(72,      "RSI Max (CALL)",          minval=50,               group=g2)
+rsi_bear_lo  = input.int(28,      "RSI Min (PUT)",           minval=10,               group=g2)
+rsi_bear_hi  = input.int(58,      "RSI Max (PUT)",           minval=20,               group=g2)
+body_pct     = input.float(0.55,  "Min Candle Body Ratio",   minval=0.3, maxval=0.95, group=g2)
+
+g3 = "Risk Management"
+sl_mult      = input.float(1.0,   "Stop Loss (× ATR)",       minval=0.5,              group=g3)
+tp1_mult     = input.float(1.5,   "Target 1 (× ATR)",        minval=0.5,              group=g3)
+tp2_mult     = input.float(3.0,   "Target 2 (× ATR)",        minval=1.0,              group=g3)
+
+g4 = "Signal Quality"
+cd_bars      = input.int(3,       "Signal Cooldown (bars)",  minval=1,                group=g4)
+htf_tf       = input.timeframe("60", "HTF Trend Filter",                              group=g4)
+htf_buf_mult = input.float(0.10,  "HTF EMA Buffer (× ATR)",  minval=0.0, maxval=1.0,  group=g4)
+
+g5 = "Session Time Filter"
+sess_sh      = input.int(9,       "Session Start Hour",      minval=0, maxval=23,     group=g5)
+sess_sm      = input.int(45,      "Session Start Minute",    minval=0, maxval=59,     group=g5)
+sess_eh      = input.int(15,      "Session End Hour",        minval=0, maxval=23,     group=g5)
+sess_em      = input.int(30,      "Session End Minute",      minval=0, maxval=59,     group=g5)
+
+g6 = "Daily Risk Limits"
+max_daily    = input.int(4,       "Max Signals Per Day",     minval=1, maxval=20,     group=g6)
+
+g7 = "Tickers"
+t1 = input.symbol("SPY",  "Ticker 1", group=g7)
+t2 = input.symbol("QQQ",  "Ticker 2", group=g7)
+t3 = input.symbol("AAPL", "Ticker 3", group=g7)
+t4 = input.symbol("TSLA", "Ticker 4", group=g7)
+t5 = input.symbol("NVDA", "Ticker 5", group=g7)
+
+// ─── HTF TREND FUNCTION ───────────────────────────────────────────────────────
+// Kept separate so it can be passed to request.security without nesting
+f_htf() =>
+    h_ema = ta.ema(close, ema_len)
+    h_atr = ta.atr(atr_len)
+    h_buf = h_atr * htf_buf_mult
+    [close > h_ema + h_buf, close < h_ema - h_buf]
+
+// ─── DATA FETCH ───────────────────────────────────────────────────────────────
+[c1, o1, hi1, lo1, v1] = request.security(t1, timeframe.period, [close, open, high, low, volume])
+[c2, o2, hi2, lo2, v2] = request.security(t2, timeframe.period, [close, open, high, low, volume])
+[c3, o3, hi3, lo3, v3] = request.security(t3, timeframe.period, [close, open, high, low, volume])
+[c4, o4, hi4, lo4, v4] = request.security(t4, timeframe.period, [close, open, high, low, volume])
+[c5, o5, hi5, lo5, v5] = request.security(t5, timeframe.period, [close, open, high, low, volume])
+
+[htf_bull1, htf_bear1] = request.security(t1, htf_tf, f_htf(), lookahead=barmerge.lookahead_on)
+[htf_bull2, htf_bear2] = request.security(t2, htf_tf, f_htf(), lookahead=barmerge.lookahead_on)
+[htf_bull3, htf_bear3] = request.security(t3, htf_tf, f_htf(), lookahead=barmerge.lookahead_on)
+[htf_bull4, htf_bear4] = request.security(t4, htf_tf, f_htf(), lookahead=barmerge.lookahead_on)
+[htf_bull5, htf_bear5] = request.security(t5, htf_tf, f_htf(), lookahead=barmerge.lookahead_on)
+
+// ─── SIGNAL COMPUTATION ───────────────────────────────────────────────────────
+// ATR uses explicit true range so it works on fetched (non-built-in) series.
+// Pine v5 maintains separate var state per call site, so cooldown and daily
+// counters are independent for each ticker.
+// Returns [sig, price, rsi, atr, sl, tp1, tp2] — sig: 1=CALL, -1=PUT, 0=none
+f_compute(src_c, src_o, src_h, src_l, src_v, htf_bull, htf_bear) =>
+    tr       = math.max(math.max(src_h - src_l,
+                        math.abs(src_h - nz(src_c[1], src_c))),
+                        math.abs(src_l - nz(src_c[1], src_c)))
+    atr_v    = ta.rma(tr, atr_len)
+    atr_s    = ta.sma(atr_v, atr_volat)
+    ema_v    = ta.ema(src_c, ema_len)
+    rsi_v    = ta.rsi(src_c, rsi_len)
+    avg_v    = ta.sma(src_v, vol_len)
+
+    above    = src_c > ema_v
+    below    = src_c < ema_v
+    vol_spk  = src_v / avg_v > vol_mult
+    vol_rise = atr_v > atr_s
+    vol_pres = atr_v >= atr_s * 0.85
+    rsi_call = rsi_v >= rsi_bull_lo and rsi_v <= rsi_bull_hi
+    rsi_put  = rsi_v >= rsi_bear_lo and rsi_v <= rsi_bear_hi
+    rsi_conf = rsi_call and rsi_put
+    body_v   = math.abs(src_c - src_o)
+    rng_v    = src_h - src_l
+    body_str = rng_v > 0 and (body_v / rng_v) >= body_pct
+    tp_ok    = tp2_mult > tp1_mult
+
+    t_val    = time("", "0000-2359")
+    bar_mins = hour(t_val, syminfo.timezone) * 60 + minute(t_val, syminfo.timezone)
+    in_sess  = bar_mins >= (sess_sh * 60 + sess_sm) and bar_mins <= (sess_eh * 60 + sess_em)
+
+    var int last_bar = 0
+    cd_ok = (bar_index - last_bar) >= cd_bars
+
+    var int d_count = 0
+    var int last_d  = 0
+    if dayofweek(time) != last_d
+        d_count := 0
+        last_d  := dayofweek(time)
+    d_ok = d_count < max_daily
+
+    call_raw = above and htf_bull and vol_spk and vol_rise and rsi_call
+             and not rsi_conf and body_str and src_c > src_o and in_sess and tp_ok
+    put_raw  = below and htf_bear and vol_spk and vol_pres and rsi_put
+             and not rsi_conf and body_str and src_c < src_o and in_sess and tp_ok
+
+    call_sig = call_raw and cd_ok and d_ok
+    put_sig  = put_raw  and cd_ok and d_ok
+
+    if call_sig or put_sig
+        d_count  := d_count + 1
+        last_bar := bar_index
+
+    sig = call_sig ? 1 : put_sig ? -1 : 0
+    sl  = call_sig ? src_c - atr_v * sl_mult  : put_sig ? src_c + atr_v * sl_mult  : na
+    tp1 = call_sig ? src_c + atr_v * tp1_mult : put_sig ? src_c - atr_v * tp1_mult : na
+    tp2 = call_sig ? src_c + atr_v * tp2_mult : put_sig ? src_c - atr_v * tp2_mult : na
+
+    [sig, src_c, rsi_v, atr_v, sl, tp1, tp2]
+
+[sig1, p1, r1, a1, sl1, t1p1, t1p2] = f_compute(c1, o1, hi1, lo1, v1, htf_bull1, htf_bear1)
+[sig2, p2, r2, a2, sl2, t2p1, t2p2] = f_compute(c2, o2, hi2, lo2, v2, htf_bull2, htf_bear2)
+[sig3, p3, r3, a3, sl3, t3p1, t3p2] = f_compute(c3, o3, hi3, lo3, v3, htf_bull3, htf_bear3)
+[sig4, p4, r4, a4, sl4, t4p1, t4p2] = f_compute(c4, o4, hi4, lo4, v4, htf_bull4, htf_bear4)
+[sig5, p5, r5, a5, sl5, t5p1, t5p2] = f_compute(c5, o5, hi5, lo5, v5, htf_bull5, htf_bear5)
+
+// ─── DASHBOARD TABLE ──────────────────────────────────────────────────────────
+f_fmt(v, dec) =>
+    na(v) ? "—" : str.tostring(math.round(v, dec))
+
+if barstate.islast
+    var table dash = table.new(position.middle_right, 8, 7,
+                               bgcolor=color.new(color.black, 80),
+                               border_width=1,
+                               border_color=color.new(color.gray, 55))
+
+    // Header row
+    col_hdrs = array.from("Ticker", "Signal", "Price", "RSI", "ATR", "SL", "TP1", "TP2")
+    for col = 0 to 7
+        table.cell(dash, col, 0, array.get(col_hdrs, col),
+                   text_color=color.white, text_size=size.small,
+                   bgcolor=color.new(color.gray, 40))
+
+    // Data
+    tickers = array.from(t1,   t2,   t3,   t4,   t5)
+    sigs    = array.from(sig1, sig2, sig3, sig4, sig5)
+    prices  = array.from(p1,   p2,   p3,   p4,   p5)
+    rsis    = array.from(r1,   r2,   r3,   r4,   r5)
+    atrs    = array.from(a1,   a2,   a3,   a4,   a5)
+    sls     = array.from(sl1,  sl2,  sl3,  sl4,  sl5)
+    tp1s    = array.from(t1p1, t2p1, t3p1, t4p1, t5p1)
+    tp2s    = array.from(t1p2, t2p2, t3p2, t4p2, t5p2)
+
+    for row = 0 to 4
+        sig_v   = array.get(sigs, row)
+        is_call = sig_v == 1
+        is_put  = sig_v == -1
+        sig_lbl = is_call ? "▲ CALL" : is_put ? "▼ PUT" : "—"
+        sig_bg  = is_call ? color.new(color.lime, 20)
+                : is_put  ? color.new(color.red,  20)
+                :            color.new(color.gray, 60)
+
+        table.cell(dash, 0, row + 1, array.get(tickers, row),
+                   text_color=color.white,  text_size=size.small)
+        table.cell(dash, 1, row + 1, sig_lbl,
+                   bgcolor=sig_bg,          text_color=color.white, text_size=size.small)
+        table.cell(dash, 2, row + 1, f_fmt(array.get(prices, row), 2),
+                   text_color=color.white,  text_size=size.small)
+        table.cell(dash, 3, row + 1, f_fmt(array.get(rsis,   row), 1),
+                   text_color=color.white,  text_size=size.small)
+        table.cell(dash, 4, row + 1, f_fmt(array.get(atrs,   row), 4),
+                   text_color=color.white,  text_size=size.small)
+        table.cell(dash, 5, row + 1, f_fmt(array.get(sls,    row), 2),
+                   text_color=color.white,  text_size=size.small)
+        table.cell(dash, 6, row + 1, f_fmt(array.get(tp1s,   row), 2),
+                   text_color=color.white,  text_size=size.small)
+        table.cell(dash, 7, row + 1, f_fmt(array.get(tp2s,   row), 2),
+                   text_color=color.white,  text_size=size.small)
+
+    // Footer: active timeframe context
+    table.cell(dash, 0, 6, "TF: " + timeframe.period + "  |  HTF: " + htf_tf,
+               text_color=color.new(color.gray, 30), text_size=size.tiny)
+    table.cell(dash, 1, 6, "", text_size=size.tiny)
+    table.cell(dash, 2, 6, "", text_size=size.tiny)
+    table.cell(dash, 3, 6, "", text_size=size.tiny)
+    table.cell(dash, 4, 6, "", text_size=size.tiny)
+    table.cell(dash, 5, 6, "", text_size=size.tiny)
+    table.cell(dash, 6, 6, "", text_size=size.tiny)
+    table.cell(dash, 7, 6, "", text_size=size.tiny)
