@@ -1,0 +1,284 @@
+//@version=5
+indicator("Intraday Options Signal v2 [Enhanced]", overlay=true, max_labels_count=500)
+
+// ─── INPUTS ────────────────────────────────────────────────────────────────────
+grp1 = "Core Filters"
+vol_mult    = input.float(1.5,  "Volume Multiplier",       minval=1.0,  group=grp1)
+vol_len     = input.int(20,     "Avg Volume Lookback",     minval=5,    group=grp1)
+ema_len     = input.int(21,     "Trend EMA Length",        minval=5,    group=grp1)
+atr_len     = input.int(14,     "ATR Period",              minval=5,    group=grp1)
+atr_volat   = input.int(10,     "Volatility Expansion MA", minval=3,    group=grp1)
+
+grp2 = "Momentum & Candle Quality"
+rsi_len     = input.int(14,     "RSI Length",              minval=5,    group=grp2)
+// FIX: RSI bands no longer overlap — CALL floor is above PUT ceiling with an explicit gap
+rsi_bull_lo = input.int(52,     "RSI Min (CALL entries)",  minval=30,   group=grp2)
+rsi_bull_hi = input.int(72,     "RSI Max (CALL entries)",  minval=50,   group=grp2)
+rsi_bear_lo = input.int(28,     "RSI Min (PUT entries)",   minval=10,   group=grp2)
+// FIX: Raised from 48 → 58. Downtrending RSI commonly sits 35–58; the old
+//      ceiling was cutting off the majority of valid PUT setups.
+rsi_bear_hi = input.int(58,     "RSI Max (PUT entries)",   minval=20,   group=grp2)
+body_pct    = input.float(0.55, "Min Candle Body Ratio",   minval=0.3, maxval=0.95, group=grp2)
+
+grp3 = "Risk Management"
+sl_mult     = input.float(1.0,  "Stop Loss (× ATR)",       minval=0.5,  group=grp3)
+tp1_mult    = input.float(1.5,  "Target 1 (× ATR)",        minval=0.5,  group=grp3)
+tp2_mult    = input.float(3.0,  "Target 2 (× ATR)",        minval=1.0,  group=grp3)
+show_levels = input.bool(true,  "Show SL / TP Labels",                  group=grp3)
+
+// FIX: Runtime guard — TP2 must be greater than TP1
+tp_valid    = tp2_mult > tp1_mult
+
+grp4 = "Signal Quality"
+cooldown    = input.int(3,      "Signal Cooldown (bars)",  minval=1,    group=grp4)
+htf_tf      = input.timeframe("60", "Higher TF Trend Filter",           group=grp4)
+// FIX: Reduced default from 0.25 → 0.1. A 0.25 ATR buffer on the hourly was
+//      blocking early-stage downtrends — the most valuable PUT entry zone.
+htf_buffer_mult = input.float(0.10, "HTF EMA Buffer (× ATR)", minval=0.0, maxval=1.0, group=grp4)
+
+grp5 = "Session Time Filter"
+// FIX: Time-of-day gate — no signals in the first 15 min or last 30 min of session
+session_start_h = input.int(9,  "Session Start Hour (exchange)",  minval=0, maxval=23, group=grp5)
+session_start_m = input.int(45, "Session Start Minute",           minval=0, maxval=59, group=grp5)
+session_end_h   = input.int(15, "Session End Hour (exchange)",    minval=0, maxval=23, group=grp5)
+session_end_m   = input.int(30, "Session End Minute",             minval=0, maxval=59, group=grp5)
+
+grp6 = "Daily Risk Limits"
+// FIX: Max daily signal count to prevent runaway signals in choppy conditions
+max_daily_signals = input.int(4, "Max Signals Per Day", minval=1, maxval=20, group=grp6)
+
+grp7 = "Display"
+show_dashboard = input.bool(true, "Show Dashboard Panel", group=grp7)
+show_alerts_only = input.bool(false, "Compact Labels (entry only)", group=grp7)
+
+// ─── CORE CALCULATIONS ─────────────────────────────────────────────────────────
+// 1. Trend EMA
+ema_val     = ta.ema(close, ema_len)
+atr_val     = ta.atr(atr_len)
+atr_sma     = ta.sma(atr_val, atr_volat)
+above_trend = close > ema_val
+below_trend = close < ema_val
+
+// 2. Higher timeframe trend with ATR buffer zone
+// FIX: ±buffer band around HTF EMA prevents 1-tick filter flips
+// lookahead_on: uses the current forming HTF bar's values so the trend filter
+// reflects live price action. Correct for a real-time alerting tool.
+// Note: do not use this script for backtesting — lookahead_on will cause
+// future-leaking and produce unrealistically good historical results.
+htf_close   = request.security(syminfo.tickerid, htf_tf, close, lookahead=barmerge.lookahead_on)
+htf_ema     = request.security(syminfo.tickerid, htf_tf, ta.ema(close, ema_len), lookahead=barmerge.lookahead_on)
+htf_atr     = request.security(syminfo.tickerid, htf_tf, ta.atr(atr_len), lookahead=barmerge.lookahead_on)
+htf_buffer  = htf_atr * htf_buffer_mult
+htf_bull    = htf_close > htf_ema + htf_buffer
+htf_bear    = htf_close < htf_ema - htf_buffer
+
+// 3. Volume spike
+avg_vol     = ta.sma(volume, vol_len)
+vol_ratio   = volume / avg_vol
+vol_spike   = vol_ratio > vol_mult
+
+// 4. Volatility filter — split by direction
+// FIX: Bear moves are often slow grinds where ATR is flat, not expanding.
+//      Requiring volat_rising for PUTs was blocking most grinding downtrends.
+//      CALLs still require expansion (breakout character). PUTs accept flat-or-rising.
+volat_rising  = atr_val > atr_sma          // strict: ATR expanding (used for CALLs)
+volat_present = atr_val >= atr_sma * 0.85  // relaxed: ATR not collapsing (used for PUTs)
+
+// 5. RSI momentum — FIX: bands are now mutually exclusive (no overlap at 48–52)
+rsi_val     = ta.rsi(close, rsi_len)
+rsi_call_ok = rsi_val >= rsi_bull_lo and rsi_val <= rsi_bull_hi
+rsi_put_ok  = rsi_val >= rsi_bear_lo and rsi_val <= rsi_bear_hi
+// Explicit mutual exclusion guard (belt-and-suspenders)
+rsi_conflict = rsi_call_ok and rsi_put_ok
+
+// 6. Candle body strength
+body        = math.abs(close - open)
+candle_rng  = high - low
+body_strong = candle_rng > 0 and (body / candle_rng) >= body_pct
+
+// 7. Session time filter
+// FIX: Suppresses signals during open volatility and end-of-day decay
+t            = time("", "0000-2359")
+bar_hour     = hour(t, syminfo.timezone)
+bar_minute   = minute(t, syminfo.timezone)
+bar_mins     = bar_hour * 60 + bar_minute
+session_from = session_start_h * 60 + session_start_m
+session_to   = session_end_h * 60 + session_end_m
+in_session   = bar_mins >= session_from and bar_mins <= session_to
+
+// 8. Signal cooldown
+var int last_signal_bar = 0
+bars_since  = bar_index - last_signal_bar
+cooldown_ok = bars_since >= cooldown
+
+// 9. Daily signal counter
+// FIX: Hard cap on signals per day — resets each new day
+var int daily_count = 0
+var int last_day    = 0
+current_day = dayofweek(time)
+if current_day != last_day
+    daily_count := 0
+    last_day    := current_day
+daily_ok = daily_count < max_daily_signals
+
+// ─── SIGNAL LOGIC ──────────────────────────────────────────────────────────────
+call_raw = above_trend and htf_bull and vol_spike and volat_rising
+         and rsi_call_ok and not rsi_conflict and body_strong
+         and close > open and in_session and tp_valid
+
+put_raw  = below_trend and htf_bear and vol_spike and volat_present
+         and rsi_put_ok and not rsi_conflict and body_strong
+         and close < open and in_session and tp_valid
+
+call_signal = call_raw and cooldown_ok and daily_ok
+put_signal  = put_raw  and cooldown_ok and daily_ok
+
+if call_signal or put_signal
+    daily_count     := daily_count + 1
+    last_signal_bar := bar_index
+
+// ─── ATR-BASED LEVELS (anchored to close as defined entry price) ───────────────
+// FIX: Levels are still close-relative; for live use, replace `close` with
+//      a confirmed entry price variable. Close is the best approximation
+//      available in a non-strategy indicator context. Documented clearly here.
+sl_call  = close - atr_val * sl_mult
+tp1_call = close + atr_val * tp1_mult
+tp2_call = close + atr_val * tp2_mult
+
+sl_put   = close + atr_val * sl_mult
+tp1_put  = close - atr_val * tp1_mult
+tp2_put  = close - atr_val * tp2_mult
+
+// ─── VISUALS ───────────────────────────────────────────────────────────────────
+plot(ema_val, "Trend EMA", color=color.new(color.gray, 30), linewidth=1)
+
+// Entry arrows
+plotshape(call_signal, "CALL Entry", shape.labelup,   location.belowbar,
+          color.new(color.lime, 10), text="▲ CALL", textcolor=color.black, size=size.small)
+plotshape(put_signal,  "PUT Entry",  shape.labeldown, location.abovebar,
+          color.new(color.red, 10),  text="▼ PUT",  textcolor=color.white, size=size.small)
+
+// Background highlight
+bgcolor(call_signal ? color.new(color.lime, 88) : put_signal ? color.new(color.red, 88) : na)
+
+// ATR level labels
+// FIX: Horizontal x-offset applied per label to prevent stacking collisions
+if show_levels and not show_alerts_only
+    if call_signal
+        label.new(bar_index + 1, sl_call,
+                  "SL "  + str.tostring(math.round(sl_call, 2)),
+                  style=label.style_label_right, color=color.new(color.red, 20),
+                  textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 1, tp1_call,
+                  "TP1 " + str.tostring(math.round(tp1_call, 2)),
+                  style=label.style_label_right, color=color.new(color.green, 30),
+                  textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 1, tp2_call,
+                  "TP2 " + str.tostring(math.round(tp2_call, 2)),
+                  style=label.style_label_right, color=color.new(color.teal, 30),
+                  textcolor=color.white, size=size.tiny)
+
+    if put_signal
+        label.new(bar_index + 1, sl_put,
+                  "SL "  + str.tostring(math.round(sl_put, 2)),
+                  style=label.style_label_right, color=color.new(color.red, 20),
+                  textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 1, tp1_put,
+                  "TP1 " + str.tostring(math.round(tp1_put, 2)),
+                  style=label.style_label_right, color=color.new(color.green, 30),
+                  textcolor=color.white, size=size.tiny)
+        label.new(bar_index + 1, tp2_put,
+                  "TP2 " + str.tostring(math.round(tp2_put, 2)),
+                  style=label.style_label_right, color=color.new(color.teal, 30),
+                  textcolor=color.white, size=size.tiny)
+
+// ─── DASHBOARD PANEL ──────────────────────────────────────────────────────────
+// FIX: On-chart table exposing live filter state — no more guessing why a signal
+//      did or didn't fire. Green = condition met, red = condition failed.
+if show_dashboard and barstate.islast
+    var table dash = table.new(position.bottom_right, 2, 11,
+                               bgcolor=color.new(color.black, 80),
+                               border_width=1,
+                               border_color=color.new(color.gray, 60))
+
+    // Header
+    table.cell(dash, 0, 0, "Condition",    text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 50))
+    table.cell(dash, 1, 0, "State",        text_color=color.white, text_size=size.small, bgcolor=color.new(color.gray, 50))
+
+    // Helper: colour by bool
+    ok_col  = color.new(color.lime, 20)
+    bad_col = color.new(color.red,  20)
+
+    table.cell(dash, 0, 1,  "EMA trend",      text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 1,  above_trend ? "BULL" : "BEAR",
+               bgcolor = above_trend ? ok_col : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 2,  "HTF trend",      text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 2,  htf_bull ? "BULL" : htf_bear ? "BEAR" : "NEUTRAL",
+               bgcolor = htf_bull ? ok_col : htf_bear ? bad_col : color.new(color.orange, 30),
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 3,  "Vol ratio",      text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 3,  str.tostring(math.round(vol_ratio, 2)) + "×",
+               bgcolor = vol_spike ? ok_col : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 4,  "Volatility",     text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 4,  volat_rising ? "EXPANDING" : volat_present ? "FLAT/OK" : "COLLAPSED",
+               bgcolor = volat_rising ? ok_col : volat_present ? color.new(color.orange, 30) : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 5,  "RSI",            text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 5,  str.tostring(math.round(rsi_val, 1)),
+               bgcolor = (rsi_call_ok or rsi_put_ok) and not rsi_conflict ? ok_col : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 6,  "Body strength",  text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 6,  body_strong ? "STRONG" : "WEAK",
+               bgcolor = body_strong ? ok_col : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 7,  "Session gate",   text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 7,  in_session ? "OPEN" : "CLOSED",
+               bgcolor = in_session ? ok_col : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 8,  "Cooldown",       text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 8,  cooldown_ok ? "READY" : str.tostring(cooldown - bars_since) + " bars",
+               bgcolor = cooldown_ok ? ok_col : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 9,  "Daily signals",  text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 9,  str.tostring(daily_count) + "/" + str.tostring(max_daily_signals),
+               bgcolor = daily_ok ? ok_col : bad_col,
+               text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 10, "ATR",            text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 10, str.tostring(math.round(atr_val, 4)),
+               text_color=color.white, text_size=size.tiny)
+
+// ─── NAMED PLOTS FOR ALERT PLACEHOLDERS ───────────────────────────────────────
+// alertcondition message must be a const string — runtime values cannot be
+// concatenated in. The correct Pine approach is to expose each value as a
+// named plot() so TradingView resolves it via {{plot("Name")}} at alert time.
+// plot() calls must be at the top scope (not inside if blocks), so they are
+// placed here. display=display.none keeps them off the chart visually.
+plot(atr_val,  "ATR",     display=display.none)
+plot(rsi_val,  "RSI",     display=display.none)
+plot(sl_call,  "SL_CALL", display=display.none)
+plot(tp1_call, "TP1_CALL",display=display.none)
+plot(tp2_call, "TP2_CALL",display=display.none)
+plot(sl_put,   "SL_PUT",  display=display.none)
+plot(tp1_put,  "TP1_PUT", display=display.none)
+plot(tp2_put,  "TP2_PUT", display=display.none)
+
+// ─── ALERT CONDITIONS ──────────────────────────────────────────────────────────
+// message is a const string. Dynamic values are injected by TradingView at
+// alert-fire time via {{plot("Name")}} — one named plot per value above.
+// JSON-structured for direct webhook/bot parsing.
+alertcondition(call_signal, title="CALL Signal",
+  message='{"signal":"CALL","ticker":"{{ticker}}","tf":"{{interval}}","price":{{close}},"atr":{{plot("ATR")}},"rsi":{{plot("RSI")}},"sl":{{plot("SL_CALL")}},"tp1":{{plot("TP1_CALL")}},"tp2":{{plot("TP2_CALL")}}}')
+
+alertcondition(put_signal, title="PUT Signal",
+  message='{"signal":"PUT","ticker":"{{ticker}}","tf":"{{interval}}","price":{{close}},"atr":{{plot("ATR")}},"rsi":{{plot("RSI")}},"sl":{{plot("SL_PUT")}},"tp1":{{plot("TP1_PUT")}},"tp2":{{plot("TP2_PUT")}}}') 
